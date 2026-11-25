@@ -1,0 +1,85 @@
+name: Sync hosts
+'on':
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 2 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hosts-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch, validate, and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          work_dir=$(mktemp -d)
+          trap 'rm -rf -- "$work_dir"' EXIT
+          
+          validate() {
+            python3 - "$work_dir/source.txt" hosts.txt "$work_dir/validated.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          
+          pattern = re.compile(
+              rb"(?:127\.0\.0\.1|0\.0\.0\.0|::1)[ \t]+"
+              rb"(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*\.?",
+              re.IGNORECASE | re.ASCII,
+          )
+          
+          def records(data):
+              return [line for raw in data.splitlines()
+                      if (line := raw.split(b"#", 1)[0].strip())]
+          
+          source, previous, output = map(Path, sys.argv[1:])
+          data = source.read_bytes().removeprefix(b"\xef\xbb\xbf")
+          if not data.endswith(b"\n") or b"\0" in data:
+              sys.exit("Missing final newline or unexpected NUL byte")
+          
+          rows = records(data)
+          if len(rows) < 5000 or any(not pattern.fullmatch(row) for row in rows):
+              sys.exit("Invalid or unexpectedly short hosts list")
+          
+          if previous.is_file():
+              old_count = len(records(previous.read_bytes()))
+              if len(rows) * 10 < old_count * 9:
+                  sys.exit("Hosts list shrank more than 10%")
+          
+          output.write_bytes(b"\n".join(rows) + b"\n")
+          print(f"Validated {len(rows)} hosts records")
+          PY
+          }
+          
+          for attempt in 1 2 3 4; do
+            echo "Download attempt $attempt"
+            if curl --http1.1 -fsSL --connect-timeout 10 --max-time 30 \
+                 -H 'Accept-Encoding: identity' --output "$work_dir/source.txt" \
+                 'https://www.macat.vip/list.txt' && validate; then
+              cp -- "$work_dir/validated.txt" hosts.txt
+              git add -- hosts.txt
+              if git diff --cached --quiet; then
+                echo "Hosts list unchanged"
+              else
+                git config user.name 'github-actions[bot]'
+                git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+                git commit -m 'Update hosts list'
+                git push
+              fi
+              exit 0
+            fi
+            if [ "$attempt" -lt 4 ]; then
+              sleep "$((attempt * 3))"
+            fi
+          done
+          
+          echo 'No valid download received. The previous published file was kept.' >&2
+          exit 1
